@@ -218,7 +218,7 @@
             return 'ERROR_NO_MODAL'; // Что-то пошло не так, модалка не открылась
         }
 
-        // Заполнение сопроводительного
+        // Заполнение сопроводительного (если включено)
         if (config.useCover) {
             const addCoverBtn = document.querySelector(SELECTORS.modalAddCover);
             if (addCoverBtn) {
@@ -226,13 +226,17 @@
                 const area = await waitForElement(SELECTORS.modalTextarea, 2000);
                 if (area) fillTextarea(area, config.coverText);
             } else {
-                // Поле уже открыто
                 const area = document.querySelector(SELECTORS.modalTextarea);
                 if (area) fillTextarea(area, config.coverText);
             }
             await wait(randomDelay(500, 1000));
         }
-
+        
+        // Всегда пробуем получить кнопку отправки, даже если сопроводительное отключено
+        if (!submitButton) {
+            submitButton = await waitForElement(SELECTORS.modalSubmit, 2500);
+        }
+        
         // Отправка
         if (submitButton && !submitButton.disabled) {
             submitButton.click();
@@ -240,6 +244,7 @@
             await wait(1000);
             return 'OK';
         }
+
 
         return 'ERROR_SUBMIT';
     }
