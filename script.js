@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         HH.ru Auto Responder  v2.1.0
+// @name         HH.ru Auto Responder  v2.1.1
 // @namespace    http://tampermonkey.net/
-// @version      v2.1.0
+// @version      v2.1.1
 // @description  Авто-отклики на hh.ru
-// @author       Timur Geruzov (modified)
+// @author       Timur Geruzov
 // @match        *://*.hh.ru/search/vacancy*
 // @match        *://*.hh.ru/vacancy/*
 // @match        *://*.hh.ru/applicant/vacancy_response*
@@ -35,13 +35,14 @@
         applyBtn: '[data-qa="vacancy-serp__vacancy_response"], button[data-qa="vacancy-serp__vacancy_response"]',
         topApply: '[data-qa="vacancy-response-link-top"], a[data-qa="vacancy-response-link-top"]',
         modalAddCover: '[data-qa="add-cover-letter"]',
-        modalTextarea: 'textarea[data-qa="vacancy-response-popup-form-letter-input"], textarea[name="coverLetter"]',
-        modalSubmit: '[data-qa="vacancy-response-submit-popup"], button[data-qa="vacancy-response-submit-popup"]',
+        modalTextarea: 'textarea[data-qa="vacancy-response-popup-form-letter-input"], textarea[name="coverLetter"], textarea[name="text"]',
+        modalSubmit: '[data-qa="vacancy-response-submit-popup"], button[data-qa="vacancy-response-letter-submit"], button[data-qa="vacancy-response-submit-popup"]',
         nativeWrapper: '[data-qa="textarea-native-wrapper"]',
         relocationBtn: '[data-qa="relocation-warning-confirm"]',
         vacancyLink: 'a[data-qa="serp-item__title"], a[data-qa="vacancy-serp__vacancy-title"]',
         vacancyCard: 'div[data-qa="vacancy-serp__vacancy"], .vacancy-serp-item'
     };
+
 
     // Параметры по умолчанию
     const DEFAULTS = {
@@ -552,17 +553,77 @@
             }
 
             submitButton = submitButton || await waitForElement(SELECTORS.modalSubmit, 2000);
-            if (submitButton && !submitButton.disabled) {
-                await actionPause();
-                submitButton.click();
-                await actionPause();
-                StateManager.addProcessedID(vid);
-                StateManager.clearLastAttemptID();
-                await wait(1000);
-                await actionPause();
-                history.back();
-                return 'OK';
+
+            // Дополнительные фоллбеки для новой верстки
+            if (!submitButton) {
+                submitButton = document.querySelector('button[data-qa="vacancy-response-letter-submit"], button[data-qa="vacancy-response-submit-popup"]');
             }
+            if (!submitButton) {
+                // пробуем найти саму форму и её submit внутри или вызвать form.submit()
+                const form = document.querySelector('form[action="/applicant/vacancy_response/edit_ajax"], form[id^="cover-letter-"]');
+                if (form) {
+                    const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+                    if (btn) submitButton = btn;
+                    else {
+                        try { form.submit(); log('Отправил форму через form.submit() (fallback).'); }
+                        catch (e) { console.warn('form.submit fallback failed', e); }
+                    }
+                }
+            }
+
+            // --- START: более надёжный возврат после отправки ---
+            await actionPause();
+            try { submitButton.click(); } catch(e) { try { submitButton.dispatchEvent(new MouseEvent('click', {bubbles:true})); } catch(_){} }
+            await actionPause();
+
+            StateManager.addProcessedID(vid);
+            StateManager.clearLastAttemptID();
+
+            // Подождать подтверждение отправки — ищем кнопку "Чат" или текст "Резюме доставлено"
+            async function waitForSubmitConfirmation(timeout = 5000) {
+                const start = Date.now();
+                while (Date.now() - start < timeout) {
+                    if (document.querySelector('[data-qa="vacancy-response-link-view-topic"]')) return true;
+                    try {
+                        const divs = Array.from(document.querySelectorAll('div'));
+                        if (divs.some(el => el.innerText && el.innerText.trim().toLowerCase().includes('резюме доставлено'))) return true;
+                    } catch (e) { /* ignore */ }
+                    await wait(300);
+                }
+                return false;
+            }
+
+            const confirmed = await waitForSubmitConfirmation(5000);
+            const returnUrl = StateManager.getReturnUrl() || '/search/vacancy';
+
+            if (confirmed) {
+                log('Отклик подтверждён — перехожу к списку вакансий.');
+                if (returnUrl && returnUrl.includes('/search/vacancy')) {
+                    window.location.href = returnUrl;
+                } else {
+                    try { history.back(); } catch (e) { window.location.href = '/search/vacancy'; }
+                }
+            } else {
+                // fallback: попробуем history.back(), если не сработает — редирект
+                log('Подтверждение не найдено — пробую history.back() (фоллбек).', true);
+                try {
+                    history.back();
+                    // если через 1s всё ещё на странице ответов — редирект на сохранённый список
+                    setTimeout(() => {
+                        if (location.href.includes('/applicant/vacancy_response') || location.pathname.startsWith('/vacancy')) {
+                            window.location.href = returnUrl;
+                        }
+                    }, 1000);
+                } catch (e) {
+                    window.location.href = returnUrl;
+                }
+            }
+
+            await wait(800);
+            return 'OK';
+            // --- END ---
+
+
             return 'ERROR_SUBMIT';
         }
 
