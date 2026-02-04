@@ -1,6 +1,6 @@
 # HH.ru Auto Responder 🚀
 
-![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)
+![Version](https://img.shields.io/badge/version-2.1.1-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Tampermonkey-green.svg)
 ![Status](https://img.shields.io/badge/status-stable-success.svg)
 
