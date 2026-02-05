@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         HH.ru Auto Responder  v2.1.1
+// @name         HH.ru Auto Responder  v2.1.2
 // @namespace    http://tampermonkey.net/
-// @version      v2.1.1
+// @version      v2.1.2
 // @description  Авто-отклики на hh.ru
 // @author       Timur Geruzov
 // @match        *://*.hh.ru/search/vacancy*
@@ -185,14 +185,37 @@
         const timestamp = new Date().toLocaleTimeString();
         const entry = document.createElement('div');
         entry.textContent = `[${timestamp}] ${msg}`;
+        entry.dataset.error = isError ? '1' : '0';
         if (isError) entry.style.color = '#ff4d4f';
         const logBox = document.getElementById('ar-log-box');
         if (logBox) {
+            const errorsOnly = document.getElementById('ar-log-errors-only');
+            entry.style.display = (errorsOnly && errorsOnly.checked && !isError) ? 'none' : 'block';
             logBox.appendChild(entry);
             logBox.scrollTop = logBox.scrollHeight;
         }
         console.log(`[HH-AR] ${msg}`);
     };
+
+    const statusColors = {
+        idle: { bg: '#e5e7eb', fg: '#111827', text: 'Ожидание' },
+        running: { bg: '#dcfce7', fg: '#166534', text: 'В работе' },
+        stopped: { bg: '#fee2e2', fg: '#991b1b', text: 'Остановлено' },
+        error: { bg: '#fef3c7', fg: '#92400e', text: 'Ошибка/внимание' },
+        done: { bg: '#e0f2fe', fg: '#075985', text: 'Завершено' }
+    };
+
+    function setStatus(statusKey, customText) {
+        const st = statusColors[statusKey] || statusColors.idle;
+        const el = document.getElementById('ar-status-text');
+        if (!el) return;
+        el.textContent = customText || st.text;
+        el.style.background = st.bg;
+        el.style.color = st.fg;
+        el.style.border = `1px solid ${st.fg}22`;
+        el.style.padding = '2px 8px';
+        el.style.borderRadius = '10px';
+    }
 
     // Корректная вставка текста в textarea (учитывает React/Magritte)
     function fillTextarea(el, value) {
@@ -428,6 +451,15 @@
         }
     }
 
+    // Единый способ получить стабильный ID вакансии на странице
+    function getStableVacancyId(btn) {
+        const direct = getVacancyIDFromHref(location.href);
+        if (direct) return 'v_' + direct;
+        const last = StateManager.getLastAttemptID();
+        if (last) return last;
+        return getVacancyID(btn || document);
+    }
+
     // Открываем вакансию с списка: запоминаем lastAttempt и переходим по ссылке
     async function processVacancyOnListing(vacancyLinkEl, applyBtnOnList) {
         const href = vacancyLinkEl?.href || vacancyLinkEl.getAttribute('href');
@@ -455,8 +487,10 @@
 
     // Обработка вакансии: работает и на странице вакансии, и для кнопки на листинге
     async function processVacancy(btn) {
+        if (stopSignal) return 'STOPPED';
+
         if (location.pathname.startsWith('/vacancy/')) {
-            const vid = getVacancyID(btn || document);
+            const vid = getStableVacancyId(btn);
             StateManager.setReturnUrl(document.referrer || '/search/vacancy');
 
             const viewTime = randomDelay(config.viewMin, config.viewMax);
@@ -464,6 +498,7 @@
             await humanScrollToCompanySectionAndReturn(viewTime);
 
             await actionPause();
+            if (stopSignal) return 'STOPPED';
 
             let applyBtn = document.querySelector(SELECTORS.topApply) || await waitForElement(SELECTORS.applyBtn, config.waitForModalMs);
             if (!applyBtn) {
@@ -497,27 +532,33 @@
 
             window.scrollTo({ top: 0, behavior: 'auto' });
             await actionPause();
+            if (stopSignal) return 'STOPPED';
 
             const topBtn = document.querySelector(SELECTORS.topApply);
             if (topBtn) {
                 topBtn.scrollIntoView({ block: 'center', behavior: 'auto' });
                 await actionPause();
+                if (stopSignal) return 'STOPPED';
                 topBtn.click();
             } else {
                 applyBtn.scrollIntoView({ block: 'center', behavior: 'auto' });
                 await actionPause();
+                if (stopSignal) return 'STOPPED';
                 applyBtn.click();
             }
 
             await actionPause();
+            if (stopSignal) return 'STOPPED';
 
             let submitButton = await waitForElement(SELECTORS.modalSubmit, config.waitForModalMs);
             if (!submitButton) {
                 const relocationBtn = document.querySelector(SELECTORS.relocationBtn);
                 if (relocationBtn) {
                     await actionPause();
+                    if (stopSignal) return 'STOPPED';
                     relocationBtn.click();
                     await actionPause();
+                    if (stopSignal) return 'STOPPED';
                     submitButton = await waitForElement(SELECTORS.modalSubmit, config.waitForModalMs);
                 }
             }
@@ -533,20 +574,24 @@
 
             if (config.useCover) {
                 await actionPause();
+                if (stopSignal) return 'STOPPED';
                 const addCoverBtn = document.querySelector(SELECTORS.modalAddCover);
                 if (addCoverBtn) {
                     addCoverBtn.click();
                     await actionPause();
+                    if (stopSignal) return 'STOPPED';
                     const area = await waitForElement(SELECTORS.modalTextarea, 2000);
                     if (area) {
                         fillTextarea(area, config.coverText);
                         await actionPause();
+                        if (stopSignal) return 'STOPPED';
                     }
                 } else {
                     const area = document.querySelector(SELECTORS.modalTextarea);
                     if (area) {
                         fillTextarea(area, config.coverText);
                         await actionPause();
+                        if (stopSignal) return 'STOPPED';
                     }
                 }
                 await wait(randomDelay(500, 1000));
@@ -573,16 +618,15 @@
 
             // --- START: более надёжный возврат после отправки ---
             await actionPause();
+            if (stopSignal) return 'STOPPED';
             try { submitButton.click(); } catch(e) { try { submitButton.dispatchEvent(new MouseEvent('click', {bubbles:true})); } catch(_){} }
             await actionPause();
-
-            StateManager.addProcessedID(vid);
-            StateManager.clearLastAttemptID();
 
             // Подождать подтверждение отправки — ищем кнопку "Чат" или текст "Резюме доставлено"
             async function waitForSubmitConfirmation(timeout = 5000) {
                 const start = Date.now();
                 while (Date.now() - start < timeout) {
+                    if (stopSignal) return false;
                     if (document.querySelector('[data-qa="vacancy-response-link-view-topic"]')) return true;
                     try {
                         const divs = Array.from(document.querySelectorAll('div'));
@@ -597,12 +641,16 @@
             const returnUrl = StateManager.getReturnUrl() || '/search/vacancy';
 
             if (confirmed) {
+                StateManager.addProcessedID(vid);
+                StateManager.clearLastAttemptID();
                 log('Отклик подтверждён — перехожу к списку вакансий.');
                 if (returnUrl && returnUrl.includes('/search/vacancy')) {
                     window.location.href = returnUrl;
                 } else {
                     try { history.back(); } catch (e) { window.location.href = '/search/vacancy'; }
                 }
+                await wait(800);
+                return 'OK';
             } else {
                 // fallback: попробуем history.back(), если не сработает — редирект
                 log('Подтверждение не найдено — пробую history.back() (фоллбек).', true);
@@ -617,14 +665,10 @@
                 } catch (e) {
                     window.location.href = returnUrl;
                 }
+                await wait(800);
+                return 'NO_CONFIRM';
             }
-
-            await wait(800);
-            return 'OK';
             // --- END ---
-
-
-            return 'ERROR_SUBMIT';
         }
 
         if (btn) {
@@ -652,9 +696,7 @@
         isLoopActive = true;
         stopSignal = false;
         StateManager.setRunning(true);
-
-        const statusEl = document.getElementById('ar-status-text');
-        if(statusEl) statusEl.textContent = 'В работе';
+        setStatus('running');
 
         // Если уже на странице вакансии — обрабатываем её напрямую
         if (location.pathname.startsWith('/vacancy/')) {
@@ -663,16 +705,25 @@
             if (res === 'OK') {
                 log('Отклик отправлен. Завершаю цикл для корректного возврата.');
                 isLoopActive = false;
+                setStatus('done');
                 return;
             } else if (res === 'REDIRECT') {
                 log('Произошёл редирект/вопрос при обработке. Завершаю; watchdog вернёт нас назад.', true);
                 isLoopActive = false;
                 StateManager.setRunning(false);
+                setStatus('error');
                 return;
-            } else if (res === 'NO_APPLY_RETURNED' || res === 'ERROR_NO_MODAL' || res === 'ERROR_SUBMIT') {
+            } else if (res === 'STOPPED') {
+                log('Остановлено пользователем во время обработки вакансии.');
+                isLoopActive = false;
+                StateManager.setRunning(false);
+                setStatus('stopped');
+                return;
+            } else if (res === 'NO_APPLY_RETURNED' || res === 'ERROR_NO_MODAL' || res === 'NO_CONFIRM') {
                 log(`Обработка завершилась с кодом ${res}. Завершаю цикл.`, true);
                 isLoopActive = false;
                 StateManager.setRunning(false);
+                setStatus('error');
                 return;
             }
         }
@@ -703,6 +754,12 @@
                 count++;
                 log(`Отклик #${count} отправлен.`);
                 await actionPause();
+            } else if (result === 'STOPPED') {
+                log('Обработка остановлена пользователем.');
+                isLoopActive = false;
+                StateManager.setRunning(false);
+                setStatus('stopped');
+                return;
             } else if (result === 'NAVIGATED') {
                 // Перешли на страницу вакансии — завершаем цикл, оставляя флаг running для авто-старта на новой странице
                 log('Переход на страницу вакансии — завершаю цикл для корректной навигации.');
@@ -712,6 +769,7 @@
                 log('Редирект/внешний тест. Выход из цикла — watchdog займётся возвратом.', true);
                 isLoopActive = false;
                 StateManager.setRunning(false);
+                setStatus('error');
                 return;
             } else {
                 log(`Ошибка при обработке: ${result}`, true);
@@ -721,7 +779,7 @@
         if (!location.href.includes('/applicant/vacancy_response')) {
              isLoopActive = false;
              StateManager.setRunning(false);
-             if(statusEl) statusEl.textContent = 'Завершено';
+             setStatus('done');
              log(`Работа завершена. Отправлено всего: ${count}`);
         }
     }
@@ -733,14 +791,17 @@
         const toggleBtn = document.createElement('div');
         toggleBtn.id = 'ar-toggle-btn';
         toggleBtn.textContent = '🤖';
+        toggleBtn.title = 'Открыть панель HH AutoResponder';
         toggleBtn.style.cssText = `
             position: fixed; top: 50%; right: 20px; transform: translateY(-50%);
             width: 48px; height: 48px;
-            background: #222; color: #fff; border-radius: 50%; display: none;
+            background: #222; color: #fff; border-radius: 50%; display: flex;
             align-items: center; justify-content: center; font-size: 24px; cursor: pointer;
-            z-index: 99999; box-shadow: 0 4px 12px rgba(0,0,0,0.3); border: 2px solid #fff;
+            z-index: 99999; box-shadow: 0 6px 16px rgba(0,0,0,0.35); border: 2px solid #fff;
             user-select: none; transition: all 0.2s;
         `;
+        toggleBtn.onmouseenter = () => { toggleBtn.style.transform = 'translateY(-50%) scale(1.05)'; toggleBtn.style.boxShadow = '0 10px 24px rgba(0,0,0,0.4)'; };
+        toggleBtn.onmouseleave = () => { toggleBtn.style.transform = 'translateY(-50%)'; toggleBtn.style.boxShadow = '0 6px 16px rgba(0,0,0,0.35)'; };
         document.body.appendChild(toggleBtn);
 
         const panel = document.createElement('div');
@@ -822,13 +883,20 @@
             </div>
             <div style="padding: 12px; border-top: 1px solid #eee;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                    <b>Сохранённые для ручного отклика</b>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <b>Сохранённые для ручного отклика</b>
+                        <span id="ar-manual-count" style="background:#eef2ff; color:#1e3a8a; padding:2px 8px; border-radius:10px; font-size:11px;">0</span>
+                    </div>
                     <div style="display:flex; gap:6px;">
                         <button id="ar-export-manual" style="padding:6px; border-radius:6px; border:1px solid #ddd; cursor:pointer;">Export</button>
                         <button id="ar-clear-manual" style="padding:6px; border-radius:6px; border:1px solid #ddd; cursor:pointer;">Clear</button>
                     </div>
                 </div>
                 <div id="ar-manual-list" style="max-height:120px; overflow:auto; font-size:12px; border:1px solid #f0f0f0; padding:6px; border-radius:6px; background:#fafafa"></div>
+            </div>
+            <div style="padding: 8px 12px; border-top:1px solid #eee; display:flex; justify-content:space-between; align-items:center; background:#fafafa;">
+                <label style="font-size:12px; color:#555;"><input type="checkbox" id="ar-log-errors-only" style="margin-right:6px;">Только ошибки</label>
+                <button id="ar-clear-log" style="padding:6px 10px; border-radius:6px; border:1px solid #ddd; cursor:pointer;">Clear log</button>
             </div>
             <div id="ar-log-box" style="height: 140px; overflow-y: auto; background: #1e1e1e; color: #00ff00; font-family: monospace; font-size: 11px; padding: 8px; border-top: 1px solid #333;"></div>
         `;
@@ -846,6 +914,7 @@
         el('ar-view-max').value = config.viewMax;
         el('ar-action-min').value = config.actionDelayMin;
         el('ar-action-max').value = config.actionDelayMax;
+        setStatus(StateManager.amIRunning() ? 'running' : 'idle');
 
         const saveSettings = () => {
             config.coverText = el('ar-cover-text').value;
@@ -866,12 +935,29 @@
 
         ['ar-cover-text', 'ar-use-cover-check', 'ar-min-delay', 'ar-max-delay', 'ar-limit-input', 'ar-view-min', 'ar-view-max', 'ar-action-min', 'ar-action-max'].forEach(id => el(id).addEventListener('change', saveSettings));
 
+        const applyLogFilter = () => {
+            const box = el('ar-log-box');
+            const chk = el('ar-log-errors-only');
+            if (!box || !chk) return;
+            Array.from(box.children).forEach(child => {
+                child.style.display = (chk.checked && child.dataset.error !== '1') ? 'none' : 'block';
+            });
+        };
+
+        const errChk = el('ar-log-errors-only');
+        if (errChk) errChk.onchange = applyLogFilter;
+        const clearLogBtn = el('ar-clear-log');
+        if (clearLogBtn) clearLogBtn.onclick = () => {
+            const box = el('ar-log-box');
+            if (box) box.innerHTML = '';
+        };
+
         el('ar-start-btn').onclick = startLoop;
         el('ar-stop-btn').onclick = () => {
             stopSignal = true;
             isLoopActive = false;
             StateManager.setRunning(false);
-            el('ar-status-text').textContent = 'Остановлено';
+            setStatus('stopped');
             StateManager.releaseInstanceLock(TAB_ID);
             log('Остановлено пользователем.');
         };
@@ -893,7 +979,7 @@
             }
         };
 
-        // Export: HTML, humanized dates, single URL column, dedupe by URL
+        // Export: интерактивный HTML, фильтры и сортировки
         el('ar-export-manual').onclick = () => {
             const list = StateManager.getManualList();
             if (!list || !list.length) { alert('Список пуст'); return; }
@@ -901,56 +987,227 @@
             // dedupe by url (avoid duplicate identical links)
             const seen = new Set();
             const uniq = [];
+            let duplicates = 0;
             for (const it of list) {
                 const key = String(it.url || it.vid || '').trim();
                 if (!key) continue;
-                if (seen.has(key)) continue;
+                if (seen.has(key)) { duplicates++; continue; }
                 seen.add(key);
                 uniq.push(it);
             }
 
-            const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
-            const humanAgo = (ts) => {
-                const d = Date.now() - ts;
-                const sec = Math.floor(d/1000);
-                if (sec < 60) return sec + 's';
-                const min = Math.floor(sec/60);
-                if (min < 60) return min + 'm';
-                const hr = Math.floor(min/60);
-                if (hr < 24) return hr + 'h';
-                const day = Math.floor(hr/24);
-                return day + 'd';
-            };
-
-            const rows = uniq.map(i => {
-                const ts = new Date(i.ts || Date.now());
-                const timestr = ts.toLocaleString();
-                const ago = humanAgo(i.ts || Date.now());
-                const vid = esc(i.vid || '');
-                const title = esc(i.title || '');
-                const url = esc(i.url || '');
-                return `<tr>
-                    <td style="padding:8px;border:1px solid #eee;white-space:nowrap;">${timestr}<div style="color:#7b8794;font-size:11px">${ago} ago</div></td>
-                    <td style="padding:8px;border:1px solid #eee">${vid}</td>
-                    <td style="padding:8px;border:1px solid #eee"><a href="${url}" target="_blank" rel="noopener noreferrer" style="color:#0b6ef6;text-decoration:none">${title || url}</a></td>
-                </tr>`;
-            }).join('');
+            const rowsJson = JSON.stringify(uniq).replace(/<\/script/gi, '<\\/script');
 
             const content = `<!doctype html><html><head><meta charset="utf-8"><title>HH Manual List</title><meta name="viewport" content="width=device-width,initial-scale=1">
                 <style>
-                    body{font-family:Arial,Helvetica,sans-serif;padding:18px;color:#111;background:#fff}
-                    h2{margin:0 0 8px;font-size:18px}
-                    table{border-collapse:collapse;width:100%;margin-top:12px}
-                    th{background:#f7fafc;color:#334155;padding:10px;border:1px solid #eef2f7;text-align:left}
-                    td{padding:8px;border:1px solid #eef2f7}
-                    a{word-break:break-all}
-                    .meta{color:#6b7280;font-size:13px;margin-top:6px}
+                    :root { color-scheme: light; }
+                    body{font-family:Arial,Helvetica,sans-serif;padding:18px;color:#0f172a;background:#f8fafc;}
+                    h2{margin:0 0 8px;font-size:20px;display:flex;align-items:center;gap:8px;}
+                    h2 span.badge{background:#e0f2fe;color:#075985;padding:2px 8px;border-radius:10px;font-size:12px;}
+                    .meta{color:#475569;font-size:13px;margin:6px 0 12px;}
+                    .controls{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px;}
+                    button{cursor:pointer;border-radius:6px;border:1px solid #cbd5e1;background:#fff;padding:8px 12px;font-size:13px;}
+                    button.primary{background:#0ea5e9;color:#fff;border-color:#0ea5e9;}
+                    button.danger{background:#ef4444;color:#fff;border-color:#ef4444;}
+                    input,select{padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;}
+                    table{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px;}
+                    th,td{padding:9px;border:1px solid #e2e8f0;}
+                    th{background:#f1f5f9;color:#0f172a;position:sticky;top:0;z-index:2;}
+                    tr:nth-child(even){background:#f8fafc;}
+                    a{color:#0b6ef6;text-decoration:none;word-break:break-all;}
+                    .age.fresh{color:#16a34a;font-weight:600;}
+                    .age.recent{color:#0ea5e9;font-weight:600;}
+                    .age.stale{color:#f59e0b;font-weight:600;}
+                    .age.old{color:#ef4444;font-weight:600;}
+                    .tag{display:inline-block;background:#e2e8f0;color:#475569;padding:2px 6px;border-radius:6px;font-size:11px;}
+                    .processed td{opacity:0.55;text-decoration:line-through;}
+                    @media(max-width:720px){table, thead, tbody, th, td, tr{display:block;} th{position:static;} td{border:none;border-bottom:1px solid #e2e8f0;}}
                 </style>
                 </head><body>
-                <h2>Saved vacancies for manual responses</h2>
-                <div class="meta">Export date: ${new Date().toLocaleString()} — ${uniq.length} item(s)</div>
-                <table><thead><tr><th>saved</th><th>vid</th><th>link</th></tr></thead><tbody>${rows}</tbody></table>
+                <h2>Saved vacancies <span class="badge" id="badge-count">${uniq.length}</span></h2>
+                <div class="meta">Export date: ${new Date().toLocaleString()} • Duplicates removed: ${duplicates}</div>
+                <div class="controls">
+                    <input id="filter" type="text" placeholder="Фильтр по VID/тексту/URL" style="flex:1; min-width:200px;">
+                    <select id="sort">
+                        <option value="ts_desc">Новые → старые</option>
+                        <option value="ts_asc">Старые → новые</option>
+                        <option value="title_asc">Название A→Z</option>
+                        <option value="title_desc">Название Z→A</option>
+                    </select>
+                    <select id="view-mode">
+                        <option value="new">Новые</option>
+                        <option value="opened">Открытые</option>
+                    </select>
+                    <button id="open-selected">Open selected</button>
+                    <button id="clear-processed" class="danger">Удалить помеченные</button>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width:40px;"><input type="checkbox" id="check-all"></th>
+                            <th>Saved</th>
+                            <th>VID</th>
+                            <th>Title</th>
+                            <th>Link</th>
+                            <th>Return URL</th>
+                            <th>Age</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rows"></tbody>
+                </table>
+
+                <script>
+                    const data = ${rowsJson};
+                    let sortKey = 'ts_desc';
+                    let filterText = '';
+                    let viewMode = 'new';
+                    const processed = JSON.parse(localStorage.getItem('hh_ar_manual_processed') || '{}');
+                    const selected = new Set();
+
+                    const qs = (id) => document.getElementById(id);
+
+                    function humanAgo(ts) {
+                        const d = Date.now() - ts;
+                        const sec = Math.floor(d/1000);
+                        if (sec < 60) return sec + 's';
+                        const min = Math.floor(sec/60);
+                        if (min < 60) return min + 'm';
+                        const hr = Math.floor(min/60);
+                        if (hr < 24) return hr + 'h';
+                        const day = Math.floor(hr/24);
+                        return day + 'd';
+                    }
+
+                    function ageClass(ts) {
+                        const days = (Date.now() - ts)/(1000*60*60*24);
+                        if (days < 1) return 'fresh';
+                        if (days < 3) return 'recent';
+                        if (days < 7) return 'stale';
+                        return 'old';
+                    }
+
+                    function applySort(arr) {
+                        const sorted = [...arr];
+                        sorted.sort((a,b)=>{
+                            if (sortKey === 'ts_desc') return (b.ts||0)-(a.ts||0);
+                            if (sortKey === 'ts_asc') return (a.ts||0)-(b.ts||0);
+                            const ta = (a.title||'').toLowerCase();
+                            const tb = (b.title||'').toLowerCase();
+                            if (sortKey === 'title_asc') return ta.localeCompare(tb);
+                            if (sortKey === 'title_desc') return tb.localeCompare(ta);
+                            return 0;
+                        });
+                        return sorted;
+                    }
+
+                    function render() {
+                        const tbody = qs('rows');
+                        if (!tbody) return;
+                        const ft = filterText.trim().toLowerCase();
+                        const filtered = data.filter((i, idx)=>{
+                            const pKey = i.vid || i.url || idx;
+                            if (viewMode === 'opened') {
+                                if (!processed[pKey]) return false;
+                            } else {
+                                if (processed[pKey]) return false;
+                            }
+                            if (!ft) return true;
+                            return [i.vid, i.title, i.url].some(v => (v||'').toLowerCase().includes(ft));
+                        });
+                        const sorted = applySort(filtered);
+                        let html = '';
+                        sorted.forEach((i, idx)=>{
+                            const ts = i.ts || Date.now();
+                            const ago = humanAgo(ts);
+                            const aClass = ageClass(ts);
+                            const key = i.vid || i.url || idx;
+                            const checked = selected.has(key) ? 'checked' : '';
+                            const rowClass = processed[key] ? ' class="processed"' : '';
+                            const link = i.url ? '<a data-open="1" href="' + i.url + '" target="_blank" rel="noopener noreferrer">Open</a>' : '';
+                            const ret = i.returnUrl ? '<a data-back="1" href="' + i.returnUrl + '" target="_blank" rel="noopener noreferrer">Back</a>' : '<span class="tag">n/a</span>';
+                            const title = (i.title && i.title.trim()) ? i.title : (i.url || '');
+                            html += '<tr' + rowClass + ' data-key="' + key + '">'
+                                 + '<td style="text-align:center;"><input type="checkbox" class="row-check" data-key="' + key + '" ' + checked + '></td>'
+                                 + '<td>' + new Date(ts).toLocaleString() + '</td>'
+                                 + '<td>' + (i.vid || '') + '</td>'
+                                 + '<td>' + title + '</td>'
+                                 + '<td>' + link + '</td>'
+                                 + '<td>' + ret + '</td>'
+                                 + '<td><span class="age ' + aClass + '">' + ago + '</span></td>'
+                                 + '</tr>';
+                        });
+                        tbody.innerHTML = html;
+                        const badge = qs('badge-count');
+                        if (badge) badge.textContent = filtered.length;
+                    }
+
+                    function saveProcessed() {
+                        localStorage.setItem('hh_ar_manual_processed', JSON.stringify(processed));
+                    }
+
+                    qs('filter').addEventListener('input', (e)=>{ filterText = e.target.value; render(); });
+                    qs('sort').addEventListener('change', (e)=>{ sortKey = e.target.value; render(); });
+                    qs('view-mode').addEventListener('change', (e)=>{
+                        viewMode = e.target.value;
+                        selected.clear();
+                        render();
+                    });
+
+                    qs('check-all').addEventListener('change', (e)=>{
+                        const state = e.target.checked;
+                        document.querySelectorAll('.row-check').forEach(ch => {
+                            ch.checked = state;
+                            const key = ch.dataset.key;
+                            if (!key) return;
+                            if (state) selected.add(key);
+                            else selected.delete(key);
+                        });
+                    });
+
+                    qs('rows').addEventListener('change', (e)=>{
+                        if (!e.target.classList.contains('row-check')) return;
+                        const key = e.target.dataset.key;
+                        if (!key) return;
+                        if (e.target.checked) selected.add(key);
+                        else selected.delete(key);
+                    });
+
+                    qs('open-selected').addEventListener('click', ()=>{
+                        document.querySelectorAll('.row-check:checked').forEach(ch=>{
+                            const key = ch.dataset.key;
+                            const row = data.find(i => (i.vid || i.url || '') === key);
+                            const url = row?.url;
+                            if (url) window.open(url, '_blank');
+                            if (key) processed[key] = true;
+                        });
+                        saveProcessed();
+                        selected.clear();
+                        render();
+                    });
+
+                    qs('rows').addEventListener('click', (e)=>{
+                        if (e.target.tagName !== 'A') return;
+                        if (e.target.dataset.open !== '1') return;
+                        const row = e.target.closest('tr');
+                        const key = row?.getAttribute('data-key');
+                        if (!key) return;
+                        processed[key] = true;
+                        saveProcessed();
+                        render();
+                    });
+
+                    qs('clear-processed').addEventListener('click', ()=>{
+                        if (!confirm('Удалить все помеченные как обработанные?')) return;
+                        const keys = Object.keys(processed);
+                        keys.forEach(k => delete processed[k]);
+                        saveProcessed();
+                        selected.clear();
+                        render();
+                    });
+
+                    // init
+                    render();
+                </script>
                 </body></html>`;
 
             const blob = new Blob([content], { type: 'text/html;charset=utf-8' });
@@ -973,6 +1230,8 @@
             if (!container) return;
             container.innerHTML = '';
             const list = StateManager.getManualList();
+            const cntEl = document.getElementById('ar-manual-count');
+            if (cntEl) cntEl.textContent = list?.length || 0;
             if (!list || !list.length) {
                 container.innerHTML = '<div style="color:#666;">Пусто</div>';
                 return;
@@ -1021,6 +1280,7 @@
         }
 
         // initial render
+        applyLogFilter();
         renderManualList();
 
         // expose render function for other parts of script
@@ -1061,8 +1321,7 @@
             // Авто-возобновление, если скрипт был в работе перед перезагрузкой
             if (StateManager.amIRunning()) {
                 log('Обнаружена незавершенная работа. Авто-возобновление через 1.5 сек...');
-                const statusEl = document.getElementById('ar-status-text');
-                if(statusEl) statusEl.textContent = 'Авто-запуск...';
+                setStatus('running', 'Авто-запуск...');
                 setTimeout(() => {
                     const startButton = document.getElementById('ar-start-btn');
                     if (startButton) startButton.click();
