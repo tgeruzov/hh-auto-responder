@@ -61,6 +61,52 @@
         instanceLockTtl: 30000
     };
 
+    // Безопасные и предсказуемые значения конфигурации
+    const toNum = (v, fallback) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : fallback;
+    };
+    const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+    const toSafeHhUrl = (rawUrl) => {
+        if (!rawUrl) return '';
+        try {
+            const u = new URL(String(rawUrl), location.href);
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+            if (!/(^|\.)hh\.ru$/i.test(u.hostname)) return '';
+            return u.href;
+        } catch (e) {
+            return '';
+        }
+    };
+    const normalizeConfig = (raw = {}) => {
+        const merged = { ...DEFAULTS, ...(raw || {}) };
+        const normalized = {
+            ...merged,
+            coverText: String(merged.coverText ?? DEFAULTS.coverText).slice(0, 5000),
+            useCover: merged.useCover === false ? false : true,
+            skipHidden: merged.skipHidden === false ? false : true
+        };
+
+        normalized.delayMin = clamp(Math.round(toNum(merged.delayMin, DEFAULTS.delayMin)), 300, 60000);
+        normalized.delayMax = clamp(Math.round(toNum(merged.delayMax, DEFAULTS.delayMax)), 300, 120000);
+        if (normalized.delayMin > normalized.delayMax) [normalized.delayMin, normalized.delayMax] = [normalized.delayMax, normalized.delayMin];
+
+        normalized.viewMin = clamp(Math.round(toNum(merged.viewMin, DEFAULTS.viewMin)), 1000, 180000);
+        normalized.viewMax = clamp(Math.round(toNum(merged.viewMax, DEFAULTS.viewMax)), 1000, 300000);
+        if (normalized.viewMin > normalized.viewMax) [normalized.viewMin, normalized.viewMax] = [normalized.viewMax, normalized.viewMin];
+
+        normalized.actionDelayMin = clamp(Math.round(toNum(merged.actionDelayMin, DEFAULTS.actionDelayMin)), 50, 15000);
+        normalized.actionDelayMax = clamp(Math.round(toNum(merged.actionDelayMax, DEFAULTS.actionDelayMax)), 50, 30000);
+        if (normalized.actionDelayMin > normalized.actionDelayMax) [normalized.actionDelayMin, normalized.actionDelayMax] = [normalized.actionDelayMax, normalized.actionDelayMin];
+
+        normalized.scrollStepMs = clamp(Math.round(toNum(merged.scrollStepMs, DEFAULTS.scrollStepMs)), 80, 1500);
+        normalized.waitForModalMs = clamp(Math.round(toNum(merged.waitForModalMs, DEFAULTS.waitForModalMs)), 1000, 30000);
+        normalized.instanceLockTtl = clamp(Math.round(toNum(merged.instanceLockTtl, DEFAULTS.instanceLockTtl)), 5000, 180000);
+        normalized.limit = clamp(Math.round(toNum(merged.limit, DEFAULTS.limit)), 1, 500);
+
+        return normalized;
+    };
+
     // Небольшой менеджер состояния — работа с local/session storage
     const StateManager = {
         loadConfig: () => {
@@ -144,10 +190,20 @@
         },
         addManualEntry: (entry) => {
             try {
+                const safeUrl = toSafeHhUrl(entry?.url);
+                if (!safeUrl) return;
+                const safeReturnUrl = toSafeHhUrl(entry?.returnUrl);
+                const normalizedEntry = {
+                    vid: String(entry?.vid || ('u_' + fnv1a32(safeUrl).toString(36))).slice(0, 120),
+                    url: safeUrl,
+                    returnUrl: safeReturnUrl || '',
+                    ts: Number.isFinite(Number(entry?.ts)) ? Number(entry.ts) : Date.now(),
+                    title: String(entry?.title || '').slice(0, 300)
+                };
                 const list = StateManager.getManualList();
-                const exists = list.find(e => e.vid === entry.vid || e.url === entry.url);
+                const exists = list.find(e => e.vid === normalizedEntry.vid || e.url === normalizedEntry.url);
                 if (!exists) {
-                    list.unshift(entry);
+                    list.unshift(normalizedEntry);
                     // ограничим длину списка, чтобы не раздувался
                     if (list.length > 500) list.length = 500;
                     localStorage.setItem(KEYS.manualList, JSON.stringify(list));
@@ -163,22 +219,24 @@
         clearManualList: () => localStorage.removeItem(KEYS.manualList)
     };
 
-    let config = StateManager.loadConfig();
+    let config = normalizeConfig(StateManager.loadConfig());
     let isLoopActive = false;
     let stopSignal = false;
     const TAB_ID = Math.random().toString(36).slice(2, 9);
 
-    // Пытаемся поставить кросс-вкладочный lock — если не получилось, предупреждаем в консоли
-    const hasInstance = StateManager.acquireInstanceLock(TAB_ID);
-    if (!hasInstance) {
-        console.warn('[HH-AR] Похоже, в другой вкладке уже запущен процесс. Продолжаю, но возможны дубликаты.');
+    // При авто-возобновлении сразу проверяем lock
+    if (StateManager.amIRunning()) {
+        const hasInstance = StateManager.acquireInstanceLock(TAB_ID);
+        if (!hasInstance) {
+            console.warn('[HH-AR] Обнаружен активный процесс в другой вкладке.');
+        }
     }
 
     // Утилиты
     const wait = ms => new Promise(r => setTimeout(r, ms));
     const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
     const actionPause = async () => await wait(randomDelay(config.actionDelayMin, config.actionDelayMax));
-    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const vacancyPause = async () => await wait(randomDelay(config.delayMin, config.delayMax));
 
     // Лог в панели + консоль
     const log = (msg, isError = false) => {
@@ -324,10 +382,10 @@
     // Watchdog: если попали на страницу с вопросами — пытаемся безопасно вернуться и помечаем вакансию
     function watchTheURL() {
         setInterval(() => {
-            // Обновляем timestamp instance lock
-            StateManager.touchInstanceLock(TAB_ID);
-
             if (!StateManager.amIRunning()) return;
+
+            // Обновляем timestamp instance lock только во время активной работы
+            StateManager.touchInstanceLock(TAB_ID);
 
             // Если оказались на странице вопросов/теста
             if (location.href.includes('/applicant/vacancy_response')) {
@@ -462,7 +520,8 @@
 
     // Открываем вакансию с списка: запоминаем lastAttempt и переходим по ссылке
     async function processVacancyOnListing(vacancyLinkEl, applyBtnOnList) {
-        const href = vacancyLinkEl?.href || vacancyLinkEl.getAttribute('href');
+        const hrefRaw = vacancyLinkEl?.href || vacancyLinkEl.getAttribute('href');
+        const href = toSafeHhUrl(hrefRaw);
         const vid = getVacancyID(vacancyLinkEl || applyBtnOnList);
 
         await actionPause();
@@ -672,8 +731,9 @@
         }
 
         if (btn) {
-            const vacLink = btn.closest(SELECTORS.vacancyCard)?.querySelector(SELECTORS.vacancyLink)
-                            || document.querySelector(SELECTORS.vacancyLink);
+            const card = btn.closest(SELECTORS.vacancyCard);
+            const vacLink = card?.querySelector(SELECTORS.vacancyLink)
+                            || card?.querySelector('a[href*="/vacancy/"]');
             if (!vacLink) {
                 log('Не найден селектор ссылки вакансии. Проверьте структуру карточки.', true);
                 return 'ERROR_NO_LINK';
@@ -688,9 +748,12 @@
     async function startLoop() {
         if (isLoopActive) return;
 
-        // Пробуем занять instance lock заново
+        // Жёстко занимаем instance lock: не запускаемся, если работает другая вкладка
         if (!StateManager.acquireInstanceLock(TAB_ID)) {
-            log('В другой вкладке уже запущен процесс (instance lock). Продолжаю, но возможны дубликаты.', true);
+            log('Запуск отменён: в другой вкладке уже запущен процесс (instance lock).', true);
+            StateManager.setRunning(false);
+            setStatus('error', 'Занято другой вкладкой');
+            return;
         }
 
         isLoopActive = true;
@@ -705,24 +768,25 @@
             if (res === 'OK') {
                 log('Отклик отправлен. Завершаю цикл для корректного возврата.');
                 isLoopActive = false;
-                setStatus('done');
+                setStatus('running', 'Возврат к списку...');
                 return;
             } else if (res === 'REDIRECT') {
-                log('Произошёл редирект/вопрос при обработке. Завершаю; watchdog вернёт нас назад.', true);
+                log('Произошёл редирект/вопрос при обработке. Ожидаю возврат через watchdog.', true);
                 isLoopActive = false;
-                StateManager.setRunning(false);
-                setStatus('error');
+                setStatus('running', 'Ожидание возврата...');
                 return;
             } else if (res === 'STOPPED') {
                 log('Остановлено пользователем во время обработки вакансии.');
                 isLoopActive = false;
                 StateManager.setRunning(false);
+                StateManager.releaseInstanceLock(TAB_ID);
                 setStatus('stopped');
                 return;
             } else if (res === 'NO_APPLY_RETURNED' || res === 'ERROR_NO_MODAL' || res === 'NO_CONFIRM') {
                 log(`Обработка завершилась с кодом ${res}. Завершаю цикл.`, true);
                 isLoopActive = false;
                 StateManager.setRunning(false);
+                StateManager.releaseInstanceLock(TAB_ID);
                 setStatus('error');
                 return;
             }
@@ -746,7 +810,7 @@
                 break;
             }
 
-            await actionPause();
+            await vacancyPause();
 
             const result = await processVacancy(btn);
 
@@ -758,6 +822,7 @@
                 log('Обработка остановлена пользователем.');
                 isLoopActive = false;
                 StateManager.setRunning(false);
+                StateManager.releaseInstanceLock(TAB_ID);
                 setStatus('stopped');
                 return;
             } else if (result === 'NAVIGATED') {
@@ -766,10 +831,9 @@
                 isLoopActive = false;
                 return;
             } else if (result === 'REDIRECT') {
-                log('Редирект/внешний тест. Выход из цикла — watchdog займётся возвратом.', true);
+                log('Редирект/внешний тест. Выход из цикла, ожидаю возврат через watchdog.', true);
                 isLoopActive = false;
-                StateManager.setRunning(false);
-                setStatus('error');
+                setStatus('running', 'Ожидание возврата...');
                 return;
             } else {
                 log(`Ошибка при обработке: ${result}`, true);
@@ -779,6 +843,7 @@
         if (!location.href.includes('/applicant/vacancy_response')) {
              isLoopActive = false;
              StateManager.setRunning(false);
+             StateManager.releaseInstanceLock(TAB_ID);
              setStatus('done');
              log(`Работа завершена. Отправлено всего: ${count}`);
         }
@@ -837,7 +902,7 @@
 
                 <div style="display: flex; gap: 10px; margin-bottom: 12px;">
                     <div style="flex: 1;">
-                        <div style="font-size: 10px; color: #888; margin-bottom: 2px;">Задержка между действиями (мс)</div>
+                        <div style="font-size: 10px; color: #888; margin-bottom: 2px;">Пауза перед открытием вакансии (мс)</div>
                         <div style="display:flex; align-items:center; gap: 4px;">
                             <input type="number" id="ar-min-delay" style="width: 100%; padding: 4px; border:1px solid #ddd; border-radius: 4px;" placeholder="Min">
                             <span style="color:#888">-</span>
@@ -926,9 +991,16 @@
             config.viewMax = +el('ar-view-max').value || DEFAULTS.viewMax;
             config.actionDelayMin = +el('ar-action-min').value || DEFAULTS.actionDelayMin;
             config.actionDelayMax = +el('ar-action-max').value || DEFAULTS.actionDelayMax;
-            if (config.delayMin > config.delayMax) [config.delayMin, config.delayMax] = [config.delayMax, config.delayMin];
-            if (config.viewMin > config.viewMax) [config.viewMin, config.viewMax] = [config.viewMax, config.viewMin];
-            if (config.actionDelayMin > config.actionDelayMax) [config.actionDelayMin, config.actionDelayMax] = [config.actionDelayMax, config.actionDelayMin];
+
+            config = normalizeConfig(config);
+            el('ar-min-delay').value = config.delayMin;
+            el('ar-max-delay').value = config.delayMax;
+            el('ar-limit-input').value = config.limit;
+            el('ar-view-min').value = config.viewMin;
+            el('ar-view-max').value = config.viewMax;
+            el('ar-action-min').value = config.actionDelayMin;
+            el('ar-action-max').value = config.actionDelayMax;
+
             StateManager.saveConfig(config);
             log('Настройки сохранены.');
         };
@@ -1065,6 +1137,27 @@
                     const selected = new Set();
 
                     const qs = (id) => document.getElementById(id);
+                    const escMap = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+                    const escHtml = (v) => String(v ?? '').replace(/[&<>"']/g, (ch) => escMap[ch] || ch);
+                    const keyOf = (item, idx) => {
+                        const composite = [item?.url, item?.returnUrl, item?.title, item?.ts].filter(Boolean).join('|');
+                        return String(item?.vid || composite || idx);
+                    };
+                    const encodeKey = (key) => encodeURIComponent(String(key || ''));
+                    const decodeKey = (key) => {
+                        try { return decodeURIComponent(String(key || '')); }
+                        catch (e) { return ''; }
+                    };
+                    const safeHttpUrl = (raw) => {
+                        if (!raw) return '';
+                        try {
+                            const u = new URL(String(raw));
+                            if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+                            return u.href;
+                        } catch (e) {
+                            return '';
+                        }
+                    };
 
                     function humanAgo(ts) {
                         const d = Date.now() - ts;
@@ -1105,7 +1198,7 @@
                         if (!tbody) return;
                         const ft = filterText.trim().toLowerCase();
                         const filtered = data.filter((i, idx)=>{
-                            const pKey = i.vid || i.url || idx;
+                            const pKey = keyOf(i, idx);
                             if (viewMode === 'opened') {
                                 if (!processed[pKey]) return false;
                             } else {
@@ -1120,17 +1213,20 @@
                             const ts = i.ts || Date.now();
                             const ago = humanAgo(ts);
                             const aClass = ageClass(ts);
-                            const key = i.vid || i.url || idx;
+                            const key = keyOf(i, idx);
+                            const keyEnc = encodeKey(key);
                             const checked = selected.has(key) ? 'checked' : '';
                             const rowClass = processed[key] ? ' class="processed"' : '';
-                            const link = i.url ? '<a data-open="1" href="' + i.url + '" target="_blank" rel="noopener noreferrer">Open</a>' : '';
-                            const ret = i.returnUrl ? '<a data-back="1" href="' + i.returnUrl + '" target="_blank" rel="noopener noreferrer">Back</a>' : '<span class="tag">n/a</span>';
+                            const url = safeHttpUrl(i.url);
+                            const returnUrl = safeHttpUrl(i.returnUrl);
+                            const link = url ? '<a data-open="1" href="' + escHtml(url) + '" target="_blank" rel="noopener noreferrer">Open</a>' : '<span class="tag">n/a</span>';
+                            const ret = returnUrl ? '<a data-back="1" href="' + escHtml(returnUrl) + '" target="_blank" rel="noopener noreferrer">Back</a>' : '<span class="tag">n/a</span>';
                             const title = (i.title && i.title.trim()) ? i.title : (i.url || '');
-                            html += '<tr' + rowClass + ' data-key="' + key + '">'
-                                 + '<td style="text-align:center;"><input type="checkbox" class="row-check" data-key="' + key + '" ' + checked + '></td>'
-                                 + '<td>' + new Date(ts).toLocaleString() + '</td>'
-                                 + '<td>' + (i.vid || '') + '</td>'
-                                 + '<td>' + title + '</td>'
+                            html += '<tr' + rowClass + ' data-key="' + keyEnc + '">'
+                                 + '<td style="text-align:center;"><input type="checkbox" class="row-check" data-key="' + keyEnc + '" ' + checked + '></td>'
+                                 + '<td>' + escHtml(new Date(ts).toLocaleString()) + '</td>'
+                                 + '<td>' + escHtml(i.vid || '') + '</td>'
+                                 + '<td>' + escHtml(title) + '</td>'
                                  + '<td>' + link + '</td>'
                                  + '<td>' + ret + '</td>'
                                  + '<td><span class="age ' + aClass + '">' + ago + '</span></td>'
@@ -1157,7 +1253,7 @@
                         const state = e.target.checked;
                         document.querySelectorAll('.row-check').forEach(ch => {
                             ch.checked = state;
-                            const key = ch.dataset.key;
+                            const key = decodeKey(ch.dataset.key);
                             if (!key) return;
                             if (state) selected.add(key);
                             else selected.delete(key);
@@ -1166,7 +1262,7 @@
 
                     qs('rows').addEventListener('change', (e)=>{
                         if (!e.target.classList.contains('row-check')) return;
-                        const key = e.target.dataset.key;
+                        const key = decodeKey(e.target.dataset.key);
                         if (!key) return;
                         if (e.target.checked) selected.add(key);
                         else selected.delete(key);
@@ -1174,10 +1270,10 @@
 
                     qs('open-selected').addEventListener('click', ()=>{
                         document.querySelectorAll('.row-check:checked').forEach(ch=>{
-                            const key = ch.dataset.key;
-                            const row = data.find(i => (i.vid || i.url || '') === key);
-                            const url = row?.url;
-                            if (url) window.open(url, '_blank');
+                            const key = decodeKey(ch.dataset.key);
+                            const row = data.find((i, idx) => keyOf(i, idx) === key);
+                            const url = safeHttpUrl(row?.url);
+                            if (url) window.open(url, '_blank', 'noopener,noreferrer');
                             if (key) processed[key] = true;
                         });
                         saveProcessed();
@@ -1189,7 +1285,7 @@
                         if (e.target.tagName !== 'A') return;
                         if (e.target.dataset.open !== '1') return;
                         const row = e.target.closest('tr');
-                        const key = row?.getAttribute('data-key');
+                        const key = decodeKey(row?.getAttribute('data-key'));
                         if (!key) return;
                         processed[key] = true;
                         saveProcessed();
@@ -1233,10 +1329,14 @@
             const cntEl = document.getElementById('ar-manual-count');
             if (cntEl) cntEl.textContent = list?.length || 0;
             if (!list || !list.length) {
-                container.innerHTML = '<div style="color:#666;">Пусто</div>';
+                const empty = document.createElement('div');
+                empty.style.color = '#666';
+                empty.textContent = 'Пусто';
+                container.appendChild(empty);
                 return;
             }
             list.forEach(item => {
+                const safeUrl = toSafeHhUrl(item?.url);
                 const row = document.createElement('div');
                 row.style.display = 'flex';
                 row.style.justifyContent = 'space-between';
@@ -1247,8 +1347,30 @@
                 const left = document.createElement('div');
                 left.style.flex = '1';
                 left.style.marginRight = '8px';
-                const time = new Date(item.ts).toLocaleString();
-                left.innerHTML = `<div style="font-size:11px;color:#333;margin-bottom:2px;">${item.vid} • ${time}</div><div style="font-size:11px;color:#0077cc;word-break:break-all"><a href="${item.url}" target="_blank">Открыть страницу с вопросами</a></div>`;
+                const time = new Date(Number(item?.ts) || Date.now()).toLocaleString();
+                const head = document.createElement('div');
+                head.style.fontSize = '11px';
+                head.style.color = '#333';
+                head.style.marginBottom = '2px';
+                head.textContent = `${item?.vid || 'n/a'} • ${time}`;
+
+                const linkWrap = document.createElement('div');
+                linkWrap.style.fontSize = '11px';
+                linkWrap.style.wordBreak = 'break-all';
+                if (safeUrl) {
+                    linkWrap.style.color = '#0077cc';
+                    const link = document.createElement('a');
+                    link.href = safeUrl;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.textContent = 'Открыть страницу с вопросами';
+                    linkWrap.appendChild(link);
+                } else {
+                    linkWrap.style.color = '#b91c1c';
+                    linkWrap.textContent = 'Некорректная ссылка';
+                }
+                left.appendChild(head);
+                left.appendChild(linkWrap);
 
                 const actions = document.createElement('div');
                 actions.style.display = 'flex';
@@ -1260,7 +1382,10 @@
                 openBtn.style.borderRadius = '6px';
                 openBtn.style.border = '1px solid #ddd';
                 openBtn.style.cursor = 'pointer';
-                openBtn.onclick = () => window.open(item.url, '_blank');
+                openBtn.disabled = !safeUrl;
+                openBtn.onclick = () => {
+                    if (safeUrl) window.open(safeUrl, '_blank', 'noopener,noreferrer');
+                };
 
                 const removeBtn = document.createElement('button');
                 removeBtn.textContent = 'Remove';
